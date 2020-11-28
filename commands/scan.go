@@ -2,18 +2,24 @@ package commands
 
 import (
 	"bufio"
-	"bytes"
 	sha2562 "crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jfrog/jfrog-cli-core/artifactory/commands"
 	"github.com/jfrog/jfrog-cli-core/plugins/components"
+	"github.com/jfrog/jfrog-cli-core/utils/config"
+	"github.com/jfrog/jfrog-client-go/artifactory/httpclient"
+	clientservicesutils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
+	clientutils "github.com/jfrog/jfrog-client-go/utils"
+	"github.com/jfrog/jfrog-client-go/utils/io/fileutils"
 	"github.com/jfrog/jfrog-client-go/utils/io/fileutils/checksum/utils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
+	"gopkg.in/yaml.v2"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -36,7 +42,6 @@ func GetScanCommand() components.Command {
 		Aliases:     []string{"s"},
 		Arguments:   getScanArguments(),
 		Flags:       getScanFlags(),
-		//EnvVars:     getHelloEnvVar(),
 		Action: func(c *components.Context) error {
 			return scanCmd(c)
 		},
@@ -71,56 +76,83 @@ func getScanFlags() []components.Flag {
 	}
 }
 
-//func getHelloEnvVar() []components.EnvVar {
-//	return []components.EnvVar{
-//		{
-//			Name:        "HELLO_FROG_GREET_PREFIX",
-//			Default:     "A new greet from your plugin template: ",
-//			Description: "Adds a prefix to every greet.",
-//		},
-//	}
-//}
-
-type scanConfiguration struct {
-	//details *config.ArtifactoryDetails
+type scanCommand struct {
+	details         *config.ArtifactoryDetails
 	path            string
+	xrayUrl         string
+	tgtRepo         string
 	includeSecurity bool
 	includeLicense  bool
 }
 
-//func getRtDetails(c *components.Context) (*config.ArtifactoryDetails, error) {
-//	details, err := commands.GetConfig(c.GetStringFlagValue("server-id"), false)
-//	if err != nil {
-//		return nil, err
-//	}
-//	if details.Url == "" {
-//		return nil, errors.New("no server-id was found, or the server-id has no url")
-//	}
-//	details.Url = clientutils.AddTrailingSlashIfNeeded(details.Url)
-//	err = config.CreateInitialRefreshableTokensIfNeeded(details)
-//	if err != nil {
-//		return nil, err
-//	}
-//	return details, nil
-//}
+func getRtDetails(c *components.Context) (*config.ArtifactoryDetails, error) {
+	details, err := commands.GetConfig(c.GetStringFlagValue("server-id"), false)
+	if err != nil {
+		return nil, err
+	}
+	if details.Url == "" {
+		return nil, errors.New("no server-id was found, or the server-id has no url")
+	}
+	details.Url = clientutils.AddTrailingSlashIfNeeded(details.Url)
+	err = config.CreateInitialRefreshableTokensIfNeeded(details)
+	if err != nil {
+		return nil, err
+	}
+	return details, nil
+}
+
+func GetXrayScannerConfiguration() (*ConfigFile, error) {
+	// Get configuration file path.
+	configDir, err := GetScanConfigDir()
+	if err != nil {
+		return nil, err
+	}
+	configFilePath := filepath.Join(configDir, "config.yaml")
+	exists, err := fileutils.IsFileExists(configFilePath, false)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, errors.New("xray-scanner configuration does not exist")
+	}
+	return readXrayScannerConfiguration(configFilePath)
+}
+
+func readXrayScannerConfiguration(confFilePath string) (*ConfigFile, error) {
+	// Read the template file
+	content, err := fileutils.ReadFile(confFilePath)
+	if err != nil {
+		return nil, err
+	}
+	configFile := &ConfigFile{}
+	err = yaml.Unmarshal(content, &configFile)
+	return configFile, err
+}
 
 func scanCmd(c *components.Context) error {
 	if len(c.Arguments) != 1 {
 		return errors.New("Wrong number of arguments. Expected: 1, " + "Received: " + strconv.Itoa(len(c.Arguments)))
 	}
-	var conf = new(scanConfiguration)
-	//confDetails, err := getRtDetails(c)
-	//if err != nil {
-	//	return err
-	//}
-	conf.path = c.Arguments[0]
+	configFile, err := GetXrayScannerConfiguration()
+	if err != nil {
+		return err
+	}
+	var scanCommand = new(scanCommand)
+	scanCommand.path = c.Arguments[0]
+	scanCommand.xrayUrl = configFile.XrayUrl
+	scanCommand.tgtRepo = configFile.TargetRepo
+	details, err := getRtDetails(c)
+	if err != nil {
+		return err
+	}
+	scanCommand.details = details
 	if c.GetBoolFlagValue("security-only") && c.GetBoolFlagValue("license-only") {
 		return errors.New("security-only and license-only cannot be provided together. For a full scan, avoid both flags")
 	}
-	conf.includeSecurity = !c.GetBoolFlagValue("license-only")
-	conf.includeLicense = !c.GetBoolFlagValue("security-only")
+	scanCommand.includeSecurity = !c.GetBoolFlagValue("license-only")
+	scanCommand.includeLicense = !c.GetBoolFlagValue("security-only")
 
-	return doScan(conf)
+	return scanCommand.doScan()
 }
 
 func calcSha256(path string) (string, error) {
@@ -142,13 +174,13 @@ func calcSha256(path string) (string, error) {
 	return result, nil
 }
 
-func doScan(c *scanConfiguration) error {
+func (cmd *scanCommand) doScan() error {
 	log.Output(title)
-	sha256, err := calcSha256(c.path)
+	sha256, err := calcSha256(cmd.path)
 	if err != nil {
 		return err
 	}
-	scanResponse, err := sendSummaryRequest(sha256)
+	scanResponse, err := cmd.sendSummaryRequest(sha256)
 	if err != nil {
 		return err
 	}
@@ -158,7 +190,7 @@ func doScan(c *scanConfiguration) error {
 		}
 		return nil
 	}
-	printScanSummary(scanResponse, c)
+	printScanSummary(scanResponse, cmd)
 	return nil
 }
 
@@ -231,31 +263,33 @@ type ArtifactLicense struct {
 	Components  []string `json:"components,omitempty"`
 }
 
-func sendSummaryRequest(sha256 string) (*Artifacts, error) {
-	client := &http.Client{}
-	URL := "http://127.0.0.1:8084/xray/api/v1/summary/artifact"
+func (cmd *scanCommand) sendSummaryRequest(sha256 string) (*Artifacts, error) {
+	auth, err := cmd.details.CreateArtAuthConfig()
+	if err != nil {
+		return nil, err
+	}
+	client, err := httpclient.ArtifactoryClientBuilder().SetServiceDetails(&auth).Build()
+	if err != nil {
+		return nil, err
+	}
+	httpClientsDetails := auth.CreateHttpClientDetails()
+	clientservicesutils.SetContentType("application/json", &httpClientsDetails.Headers)
+	URL := cmd.xrayUrl + "/api/v1/summary/artifact"
 	checksums := SummaryJson{Checksums: []string{sha256}}
-	jsonReq, err := json.Marshal(checksums)
-	req, err := http.NewRequest("POST", URL, bytes.NewBuffer(jsonReq))
+	content, err := json.Marshal(checksums)
+	resp, body, err := client.SendPost(URL, content, &httpClientsDetails)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.SetBasicAuth("admin", "password")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	bodyText, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if resp.StatusCode != http.StatusOK {
+		log.Error("Xray response: " + resp.Status + "\n" + clientutils.IndentJson(body))
 	}
 	artifacts := &Artifacts{}
-	err = json.Unmarshal(bodyText, artifacts)
+	err = json.Unmarshal(body, artifacts)
 	return artifacts, err
 }
 
-func printScanSummary(artifacts *Artifacts, c *scanConfiguration) {
+func printScanSummary(artifacts *Artifacts, c *scanCommand) {
 	log.Output("Scan result for: " + c.path)
 	for i, artifact := range artifacts.Artifacts {
 		log.Output(strconv.Itoa(i+1) + ". " + artifact.General.Name + "\nSHA256:" + artifact.General.Sha256 + "\n")
