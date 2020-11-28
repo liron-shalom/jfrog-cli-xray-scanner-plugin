@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestSimpleHello(t *testing.T) {
+func TestSimpleS(t *testing.T) {
 	conf := &helloConfiguration{
 		addressee: "World",
 		repeat:    1,
