@@ -2,11 +2,15 @@ package commands
 
 import (
 	"bufio"
+	"bytes"
 	sha2562 "crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/jfrog/jfrog-cli-core/artifactory/commands"
+	"github.com/jfrog/jfrog-cli-core/artifactory/commands/generic"
+	"github.com/jfrog/jfrog-cli-core/artifactory/spec"
+	utils2 "github.com/jfrog/jfrog-cli-core/artifactory/utils"
 	"github.com/jfrog/jfrog-cli-core/plugins/components"
 	"github.com/jfrog/jfrog-cli-core/utils/config"
 	"github.com/jfrog/jfrog-client-go/artifactory/httpclient"
@@ -19,21 +23,47 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
 const (
-	title = `
- __  _____    ___   __   ___ _    ___    ___  ___   _   _  _ _  _ ___ ___ 
- \ \/ / _ \  /_\ \ / /  / __| |  |_ _|  / __|/ __| /_\ | \| | \| | __| _ \
-  >  <|   / / _ \ V /  | (__| |__ | |   \__ \ (__ / _ \|  . |  . | _||   /
- /_/\_\_|_\/_/ \_\_|    \___|____|___|  |___/\___/_/ \_\_|\_|_|\_|___|_|_\
+	bold        = "\033[1m"
+	colorGreen  = "\033[32m"
+	colorRed    = "\033[31m"
+	colorCyan   = "\033[1m\033[36m"
+	colorYellow = "\033[1m\033[33m"
+	colorReset  = "\033[0m"
+	title       = string(colorGreen) + `
+ __  __                   ____ _     ___    ____                                  
+ \ \/ /_ __ __ _ _   _   / ___| |   |_ _|  / ___|  ___ __ _ _ __  _ __   ___ _ __ 
+  \  /| '__/ _* | | | | | |   | |    | |   \___ \ / __/ _* | '_ \| '_ \ / _ | '__|
+  /  \| | | (_| | |_| | | |___| |___ | |    ___) | (_| (_| | | | | | | |  __| |   
+ /_/\_|_|  \__,_|\__, |  \____|_____|___|  |____/ \___\__,_|_| |_|_| |_|\___|_|   
+                 |___/                                                          
  v1.0                                                                         
 `
-	notFoundOrScanError = "Artifact doesn't exist or not indexed/cached in Xray"
+	notFoundOrScanError    = "Artifact doesn't exist or not indexed/cached in Xray"
+	waitIntervalSeconds    = 5  // Check if the scan is completed every 5 seconds
+	intervalsBeforeFailure = 24 // Wait 2 minutes at most
 )
+
+type severityType int
+
+const (
+	low severityType = iota
+	medium
+	high
+)
+
+var severitiesMap = map[string]severityType{
+	"low":    low,
+	"medium": medium,
+	"high":   high,
+}
 
 func GetScanCommand() components.Command {
 	return components.Command{
@@ -73,16 +103,29 @@ func getScanFlags() []components.Flag {
 			Name:        "server-id",
 			Description: "Artifactory server ID configured using the config command.",
 		},
+		components.StringFlag{
+			Name:         "min-severity",
+			Description:  "Minimum security vulnerability severity to present: high|medium|low.",
+			DefaultValue: "low",
+		},
+		components.BoolFlag{
+			Name:         "keep",
+			Description:  "Keep package in Artifactory if uploaded.",
+			DefaultValue: false,
+		},
 	}
 }
 
 type scanCommand struct {
 	details         *config.ArtifactoryDetails
 	path            string
+	sha256          string
 	xrayUrl         string
 	tgtRepo         string
+	minSeverity     severityType
 	includeSecurity bool
 	includeLicense  bool
+	deletePkg       bool
 }
 
 func getRtDetails(c *components.Context) (*config.ArtifactoryDetails, error) {
@@ -146,13 +189,31 @@ func scanCmd(c *components.Context) error {
 		return err
 	}
 	scanCommand.details = details
+	scanCommand.minSeverity, err = getMinSeverity(c.GetStringFlagValue("min-severity"))
+	if err != nil {
+		return err
+	}
 	if c.GetBoolFlagValue("security-only") && c.GetBoolFlagValue("license-only") {
 		return errors.New("security-only and license-only cannot be provided together. For a full scan, avoid both flags")
 	}
 	scanCommand.includeSecurity = !c.GetBoolFlagValue("license-only")
 	scanCommand.includeLicense = !c.GetBoolFlagValue("security-only")
+	sha256, err := calcSha256(scanCommand.path)
+	if err != nil {
+		return err
+	}
+	scanCommand.sha256 = sha256
+	scanCommand.deletePkg = !c.GetBoolFlagValue("keep")
+	printBoldString(strings.Replace(title, "*", "`", -1))
+	return scanCommand.scan()
+}
 
-	return scanCommand.doScan()
+func getMinSeverity(minSeverityValue string) (severityType, error) {
+	minSeverityKey := strings.ToLower(minSeverityValue)
+	if severity, ok := severitiesMap[minSeverityKey]; ok {
+		return severity, nil
+	}
+	return low, errors.New("illegal value for min-severity, must be one of high|medium|low")
 }
 
 func calcSha256(path string) (string, error) {
@@ -174,31 +235,247 @@ func calcSha256(path string) (string, error) {
 	return result, nil
 }
 
-func (cmd *scanCommand) doScan() error {
-	log.Output(title)
-	sha256, err := calcSha256(cmd.path)
-	if err != nil {
-		return err
-	}
-	scanResponse, err := cmd.sendSummaryRequest(sha256)
+func (cmd *scanCommand) scan() error {
+	scanResponse, err := cmd.sendSummaryRequest()
 	if err != nil {
 		return err
 	}
 	if scanErrors := scanResponse.Errors; len(scanErrors) > 0 {
-		if scanErrors[0].Error == notFoundOrScanError {
-			log.Output("UPLOAD AND SCAN")
+		if scanErrors[0].unsupportedErrorOccurred() {
+			return errors.New("unsupported error from Xray: " + scanErrors[0].Error)
 		}
-		return nil
+		log.Output(cmd.path + " does not exist in Artifactory.")
+		if cmd.tgtRepo == "" {
+			return nil
+		}
+		log.Output("Xray-scanner will upload and scan the file.")
+		if err = cmd.uploadPackage(); err != nil {
+			return err
+		}
+		if scanResponse, err = cmd.waitFoScanToComplete(); err != nil {
+			return err
+		}
+		if cmd.deletePkg {
+			log.Debug("Xry-scanner removing the package from Artifactory")
+			if err = cmd.removePackage(); err != nil {
+				log.Warn("failed to delete the package: %s", err.Error())
+			}
+		}
 	}
 	printScanSummary(scanResponse, cmd)
 	return nil
+}
+
+func (ae ArtifactError) unsupportedErrorOccurred() bool {
+	return ae.Error != notFoundOrScanError
+}
+
+func (cmd *scanCommand) uploadPackage() error {
+	uploadSpec := spec.NewBuilder().
+		Pattern(cmd.path).
+		Target(strings.TrimPrefix(cmd.tgtRepo, "/")).
+		Flat(true).
+		BuildSpec()
+	uploadConfiguration := &utils2.UploadConfiguration{
+		Threads:        1,
+		Symlink:        false,
+		ExplodeArchive: false,
+		Retries:        0,
+	}
+	buildConfiguration := &utils2.BuildConfiguration{}
+	uploadCmd := generic.NewUploadCommand()
+	uploadCmd.SetUploadConfiguration(uploadConfiguration).
+		SetBuildConfiguration(buildConfiguration).
+		SetRtDetails(cmd.details).
+		SetSpec(uploadSpec)
+	if err := commands.Exec(uploadCmd); err != nil {
+		return err
+	}
+	if uploadCmd.Result().SuccessCount() == 0 {
+		return errors.New("failed to upload file to Artifactory")
+	}
+	return nil
+}
+
+func (cmd *scanCommand) removePackage() error {
+	deleteSpec := spec.NewBuilder().
+		Pattern(path.Join(cmd.tgtRepo, filepath.Base(cmd.path))).
+		BuildSpec()
+	deleteCommand := generic.NewDeleteCommand()
+	deleteCommand.SetThreads(1).SetQuiet(true).SetRtDetails(cmd.details).SetSpec(deleteSpec)
+	return commands.Exec(deleteCommand)
+}
+
+func (cmd *scanCommand) waitFoScanToComplete() (*SummaryScanResult, error) {
+	log.Output("Waiting for Xray to scan the package.")
+	for i := 0; i < intervalsBeforeFailure; i++ {
+		time.Sleep(waitIntervalSeconds * time.Second)
+		scanResponse, err := cmd.sendSummaryRequest()
+		if err != nil {
+			return nil, err
+		}
+		if scanErrors := scanResponse.Errors; len(scanErrors) > 0 {
+			if scanErrors[0].unsupportedErrorOccurred() {
+				return nil, errors.New("unsupported error from Xray: " + scanErrors[0].Error)
+			}
+			if i%4 == 0 {
+				log.Output("Scanning...")
+			}
+			continue
+		}
+		return scanResponse, nil
+	}
+	return nil, errors.New("the scan was not completed in 2 minutes. Please try again soon")
+}
+
+func (cmd *scanCommand) sendSummaryRequest() (*SummaryScanResult, error) {
+	auth, err := cmd.details.CreateArtAuthConfig()
+	if err != nil {
+		return nil, err
+	}
+	client, err := httpclient.ArtifactoryClientBuilder().SetServiceDetails(&auth).Build()
+	if err != nil {
+		return nil, err
+	}
+	httpClientsDetails := auth.CreateHttpClientDetails()
+	clientservicesutils.SetContentType("application/json", &httpClientsDetails.Headers)
+	URL := cmd.xrayUrl + "/api/v1/summary/artifact"
+	checksums := SummaryJson{Checksums: []string{cmd.sha256}}
+	content, err := json.Marshal(checksums)
+	resp, body, err := client.SendPost(URL, content, &httpClientsDetails)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Output("Xray response: " + resp.Status + "\n" + clientutils.IndentJson(body))
+		return nil, errors.New("request returned with an error")
+	}
+	artifacts := &SummaryScanResult{}
+	err = json.Unmarshal(body, artifacts)
+	return artifacts, err
+}
+
+func getColoredSeverity(severity string) string {
+	severity = strings.ToUpper(severity)
+	switch severity {
+	case "LOW":
+		return string(bold+colorCyan) + severity + string(colorReset)
+	case "MEDIUM":
+		return string(bold+colorYellow) + severity + string(colorReset)
+	case "HIGH":
+		return string(bold+colorRed) + severity + string(colorReset)
+	}
+	return ""
+}
+
+func printBoldString(str string) {
+	log.Output(bold + str + colorReset)
+}
+
+func printScanSummary(artifacts *SummaryScanResult, c *scanCommand) {
+	log.Output("Scan result for: " + c.path)
+	for i, artifact := range artifacts.Artifacts {
+		log.Output(strconv.Itoa(i+1) + ". " + artifact.General.Name + "\nSHA256:" + artifact.General.Sha256 + "\n")
+		if c.includeLicense {
+			if len(artifact.Licenses) > 0 && artifact.Licenses[0].Name == "Unknown" {
+				artifact.Licenses = artifact.Licenses[1:]
+			}
+			printBoldString("LICENSES (" + strconv.Itoa(len(artifact.Licenses)) + "):")
+			for i, license := range artifact.Licenses {
+				log.Output("  " + strconv.Itoa(i+1) + "." + license.Name)
+			}
+			log.Output()
+		}
+
+		if c.includeSecurity {
+			if c.minSeverity != low {
+				artifact.Issues = filterIssues(artifact.Issues, c.minSeverity)
+			}
+			printBoldString("VULNERABILITIES (" + strconv.Itoa(len(artifact.Issues)) + "):")
+			for _, vuln := range artifact.Issues {
+				if len(vuln.ImpactPath) > 0 {
+					lastIndex := strings.LastIndex(vuln.ImpactPath[0], "/")
+					log.Output(getColoredSeverity(vuln.Severity) + " severity [" + artifact.General.Name + " > " + vuln.ImpactPath[0][lastIndex+1:] + "] ")
+					log.Output("  Location:")
+					for i, loc := range vuln.ImpactPath {
+						log.Output("    " + strconv.Itoa(i+1) + "." + loc)
+					}
+				} else {
+					log.Output(getColoredSeverity(vuln.Severity) + "severity [" + artifact.General.Name + "] ")
+				}
+
+				log.Output("  Security Description:\n    " + strings.Replace(vuln.Description, ". ", ".\n    ", -1))
+				if cveData := getCvePrintableData(vuln.Cves); cveData != "" {
+					log.Output(strings.TrimSuffix(cveData, "\n"))
+				}
+
+				log.Output()
+			}
+		}
+	}
+}
+
+func filterIssues(issues []ArtifactIssue, minSevirity severityType) (filteredIssues []ArtifactIssue) {
+	for _, issue := range issues {
+		if severity, ok := severitiesMap[strings.ToLower(issue.Severity)]; ok {
+			if severity >= minSevirity {
+				filteredIssues = append(filteredIssues, issue)
+			}
+		}
+	}
+	return
+}
+
+func getCvePrintableData(cves []Cve) string {
+	var buffer bytes.Buffer
+
+	if len(cves) == 0 {
+		return ""
+	}
+
+	for _, cve := range cves {
+		if cve.Cve != "" {
+			buffer.WriteString("    CVE:" + cve.Cve + "\n")
+		}
+		if cve.CvssV2 != "" {
+			buffer.WriteString("    CVSSv2:" + cve.CvssV2 + "\n")
+		}
+		if cve.CvssV3 != "" {
+			buffer.WriteString("    CVSSv3:" + cve.CvssV3 + "\n")
+		}
+		if len(cve.Cwe) > 0 {
+			buffer.WriteString("    CWE:" + strings.Join(cve.Cwe, ",") + "\n")
+		}
+	}
+	return "  CVEs:\n" + buffer.String()
+}
+
+func getImpactPathPrintableData(impactPaths []string) string {
+	var buffer bytes.Buffer
+	compMap := make(map[string]bool)
+	if len(impactPaths) == 0 {
+		return ""
+	}
+	buffer.WriteString("Affected components:" + "\n")
+
+	for _, ip := range impactPaths {
+		li := strings.LastIndex(ip, "/")
+		compMap[ip[li+1:]] = true
+	}
+
+	count := 1
+	for comp := range compMap {
+		buffer.WriteString("  " + strconv.Itoa(count) + ". " + comp + "\n")
+		count++
+	}
+	return buffer.String()
 }
 
 type SummaryJson struct {
 	Checksums []string `json:"checksums,omitempty"`
 	Paths     []string `json:"paths,omitempty"`
 }
-type Artifacts struct {
+type SummaryScanResult struct {
 	Artifacts []ArtifactSummary `json:"artifacts"`
 	Errors    []ArtifactError   `json:"errors,omitempty"`
 }
@@ -261,55 +538,4 @@ type ArtifactLicense struct {
 	FullName    string   `json:"full_name,omitempty"`
 	MoreInfoUrl []string `json:"more_info_url,omitempty"`
 	Components  []string `json:"components,omitempty"`
-}
-
-func (cmd *scanCommand) sendSummaryRequest(sha256 string) (*Artifacts, error) {
-	auth, err := cmd.details.CreateArtAuthConfig()
-	if err != nil {
-		return nil, err
-	}
-	client, err := httpclient.ArtifactoryClientBuilder().SetServiceDetails(&auth).Build()
-	if err != nil {
-		return nil, err
-	}
-	httpClientsDetails := auth.CreateHttpClientDetails()
-	clientservicesutils.SetContentType("application/json", &httpClientsDetails.Headers)
-	URL := cmd.xrayUrl + "/api/v1/summary/artifact"
-	checksums := SummaryJson{Checksums: []string{sha256}}
-	content, err := json.Marshal(checksums)
-	resp, body, err := client.SendPost(URL, content, &httpClientsDetails)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		log.Error("Xray response: " + resp.Status + "\n" + clientutils.IndentJson(body))
-	}
-	artifacts := &Artifacts{}
-	err = json.Unmarshal(body, artifacts)
-	return artifacts, err
-}
-
-func printScanSummary(artifacts *Artifacts, c *scanCommand) {
-	log.Output("Scan result for: " + c.path)
-	for i, artifact := range artifacts.Artifacts {
-		log.Output(strconv.Itoa(i+1) + ". " + artifact.General.Name + "\nSHA256:" + artifact.General.Sha256 + "\n")
-		if c.includeLicense {
-			log.Output("LICENSES (" + strconv.Itoa(len(artifact.Licenses)) + "):")
-			for i, license := range artifact.Licenses {
-				log.Output(strconv.Itoa(i+1) + ". " + license.Name)
-			}
-			log.Output()
-		}
-		if c.includeSecurity {
-			log.Output("VULNERABILITIES (" + strconv.Itoa(len(artifact.Issues)) + "):")
-			for _, vuln := range artifact.Issues {
-				log.Output("Summary:" + vuln.Summary)
-				log.Output("Description:" + vuln.Description)
-				log.Output("Severity:" + vuln.Severity)
-				log.Output("Provider:" + vuln.Provider)
-				log.Output()
-			}
-		}
-		log.Output("_______________________________________________________________\n")
-	}
 }

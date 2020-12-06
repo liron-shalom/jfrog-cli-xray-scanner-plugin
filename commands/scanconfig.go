@@ -17,7 +17,7 @@ import (
 
 func GetScanConfigCommand() components.Command {
 	return components.Command{
-		Name:        "scan-config",
+		Name:        "scanner-config",
 		Description: "Generate scanner configuration.",
 		Aliases:     []string{"sc"},
 		Action: func(c *components.Context) error {

@@ -12,7 +12,7 @@ func main() {
 
 func getApp() components.App {
 	app := components.App{}
-	app.Name = "xray-scan"
+	app.Name = "xray-scanner"
 	app.Description = "Jfrog Xray packages scanner."
 	app.Version = "v0.1.0"
 	app.Commands = getCommands()
