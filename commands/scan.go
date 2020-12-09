@@ -374,8 +374,8 @@ func printBoldString(str string) {
 
 func printScanSummary(artifacts *SummaryScanResult, c *scanCommand) {
 	log.Output("Scan result for: " + c.path)
-	for i, artifact := range artifacts.Artifacts {
-		log.Output(strconv.Itoa(i+1) + ". " + artifact.General.Name + "\nSHA256:" + artifact.General.Sha256 + "\n")
+	for _, artifact := range artifacts.Artifacts {
+		log.Output("SHA256:" + artifact.General.Sha256 + "\n")
 		if c.includeLicense {
 			if len(artifact.Licenses) > 0 && artifact.Licenses[0].Name == "Unknown" {
 				artifact.Licenses = artifact.Licenses[1:]
@@ -395,7 +395,12 @@ func printScanSummary(artifacts *SummaryScanResult, c *scanCommand) {
 			for _, vuln := range artifact.Issues {
 				if len(vuln.ImpactPath) > 0 {
 					lastIndex := strings.LastIndex(vuln.ImpactPath[0], "/")
-					log.Output(getColoredSeverity(vuln.Severity) + " severity [" + artifact.General.Name + " > " + vuln.ImpactPath[0][lastIndex+1:] + "] ")
+					infectedComp := vuln.ImpactPath[0][lastIndex+1:]
+					infectedPath := artifact.General.Name
+					if infectedComp != artifact.General.Name {
+						infectedPath += " > " + infectedComp
+					}
+					log.Output(getColoredSeverity(vuln.Severity) + " severity [" + infectedPath + "] ")
 					log.Output("  Location:")
 					for i, loc := range vuln.ImpactPath {
 						log.Output("    " + strconv.Itoa(i+1) + "." + loc)

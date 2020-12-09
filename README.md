@@ -2,21 +2,17 @@
 
 ## About this plugin
 This plugin uses JFrog Xray to scan local packages for security vulnerabilities and licenses.
-The plugin wil search the package in Artifactory,
+The plugin will search the package in Artifactory,
 and if the package does not exist you can allow the plugin to upload the package in order to scan it.
 
 ## Installation with JFrog CLI
-Installing the latest version:
-
-`$ jfrog plugin install xray-scanner`
-
-Installing a specific version:
-
-`$ jfrog plugin install xray-scanner@version`
-
-Uninstalling a plugin
-
-`$ jfrog plugin uninstall hello-frog`
+Since this plugin is currently not included in [JFrog CLI Plugins Registry](https://github.com/jfrog/jfrog-cli-plugins-reg), it needs to be built and installed manually. Follow these steps to install and use this plugin with JFrog CLI.
+1. Make sure JFrog CLI is installed on you machine by running ```jfrog```. If it is not installed, [install](https://jfrog.com/getcli/) it.
+2. Create a directory named ```plugins``` under ```~/.jfrog/``` if it does not exist already.
+3. Clone this repository.
+4. CD into the root directory of the cloned project.
+5. Run ```go build``` to create the binary in the current directory.
+6. Copy the binary into the ```~/.jfrog/plugins``` directory.
 
 ## Usage
 ### Commands
@@ -34,7 +30,7 @@ Uninstalling a plugin
         - license-only: Provide license scan result only. **[Default: false]**
         - min-severity: Minimum security vulnerability severity to present. **[Default: low]**
         - keep: Keep package in Artifactory if uploaded. **[Default: false]**
-        - server-id: Artifactory server ID configured using the config command **[Optional]**
+        - server-id: Artifactory server ID configured using the Jfrog CLI config command **[Optional]**
 
     - Example:
     ```
